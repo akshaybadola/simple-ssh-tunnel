@@ -1,0 +1,277 @@
+#! /usr/bin/python3
+
+import os
+import sys
+import re
+from subprocess import run, Popen, PIPE
+import argparse
+import json
+from functools import partial
+from typing import List
+
+
+def exactly_one(args):
+    return sum(map(bool, args)) == 1
+
+
+def at_most_one(args):
+    return sum(map(bool, args)) <= 1
+
+
+example_config = """
+{
+  "remote": "user@some_ip",
+  "port_regex_map": {"[11]22[0-9][0-9]": "user_a,user_b",
+                     "[22]33[0-9][0-9]": "user_c,user_d"}
+}
+"""
+
+
+def main():
+    usage = ("\rSSH Tunnel Client\n\n".rjust(10, " ") +
+             "Thin wrapper around a shell SSH client for tunneling over\n" +
+             "an available intermediary to by pass proxy or to access behind NAT\n" +
+             "The systems behind proxy must also forward their ports to the intermediary\n\n" +
+             "Usage: mytunnel [-h] CMD [OPTIONS]\n\n" +
+             "With no arguments list available ports on remote")
+    parser = argparse.ArgumentParser("SSH Tunnel Client", usage=usage,
+                                     formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--config-file", default=os.path.expanduser("~/.mytunnel_config"),
+                        help="The config file to use for reading the options\n" +
+                        "Defaults to ~/.mytunnel_config\n\n" +
+                        "The config file itself is a json file with two keys: ['remote', 'port_regex_map']\n" +
+                        "Although multiple remotes are supported, e.g., by giving --remote option\n" +
+                        "on the command line, to specify a different remote instance you'd have\n" +
+                        "to either use a different config file or override options on the command line\n\n" +
+                        f"An example config is:\n {example_config}")
+    parser.add_argument("-r", "--remote", default="",
+                        help="The remote intermediary instance")
+    parser.add_argument("-cf", "--copy-from", type=str, default="",
+                        help="Copy from the remote system to local\n" +
+                        "\"src\" and \"dest\" must be specified when copying" +
+                        """
+Example:
+
+    mytunnel -cf user --src /path/of/remote/file --dest local/path
+
+Note that you'll have to put any shell expansions for the remote path in
+single quotes to stop them being interpreted on the local machine.
+
+    mytunnel -cf user --src '~/remote/file' --dest local/path
+    mytunnel -cf user -s '/path/with/wild*' -d local/path/
+
+""")
+    parser.add_argument("-ct", "--copy-to", type=str, default="",
+                        help="Copy to the remote system from local\n" +
+                        "\"src\" and \"dest\" must be specified when copying" +
+                        """
+Example:
+
+    mytunnel -ct user --src local/path --dest /path/of/remote/file
+
+Note that you'll have to put any shell expansions for the remote path in
+single quotes to stop them being interpreted on the local machine.
+
+    mytunnel -cf user --src local/path --dest '~/remote/file/path'
+
+""")
+    parser.add_argument("-s", "--src", type=str, default="",
+                        help="Src file used with \"-cf/-ct\"")
+    parser.add_argument("-d", "--dest", type=str, default="",
+                        help="Destination file used with \"-cf/-ct\"")
+    parser.add_argument("--print-only", action="store_true",
+                        help="Only print the command don't do anything")
+    parser.add_argument("-p", "--port-regex-map", default="",
+                        help="Regular expression in JSON to check for the ports")
+    parser.add_argument("-ej", "--extra-jumps", default="",
+                        help="The json representation for extra jumps")
+    parser.add_argument("-c", "--connect", type=str, default="",
+                        help="Connect to the instance with given user")
+    parser.add_argument("-f", "--forward", type=str, default="",
+                        help="Forward the remote_port to local port.\n" +
+                        "Should be a comma pair of 'user,local_port,remote_port'.\n" +
+                        "E.g., 'mytunnel -f user,8181,4444'")
+    parser.add_argument("-l", "--list-users", action="store_true", help="List all users")
+    args = parser.parse_args()
+    config_file = args.config_file
+    if os.path.exists(config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+    else:
+        print("No config file found. Will only read options from command line.")
+        config = {}
+    # Fill in options in args from config if not given by user
+    for k, v in config.items():
+        if not getattr(args, k, None):
+            args.__dict__[k] = v
+    port_regex_map = args.port_regex_map
+    extra_jumps = args.extra_jumps
+    if isinstance(port_regex_map, str):
+        port_regex_map = json.loads(port_regex_map)
+    temp_map = {v: k for k, v in port_regex_map.items()}
+    user_map = {}
+    for k, v in temp_map.items():
+        for x in k.split(","):
+            user_map[x] = v
+    ports_regex = "\\|".join(port_regex_map.keys())
+    commands = ["connect", "forward", "copy_from", "copy_to"]
+    if not at_most_one([*map(partial(getattr, args), commands)]):
+        print(f"Only one of {commands} should be given")
+        sys.exit(1)
+    if args.connect or args.forward or args.copy_to or args.copy_from:
+        ports = check_ports(args.remote, ports_regex)
+        user = args.connect or args.forward.split(",")[0] or args.copy_to or args.copy_from
+        if not user:
+            print("User not given")
+            sys.exit(1)
+        if user in user_map:
+            maybe_port_match = [*filter(None, map(lambda x: re.match(user_map[user], x), ports))]
+            if user_map[user] == "extra":
+                ej = extra_jumps[user]
+                maybe_port_match = [*filter(None, map(lambda x: re.match(user_map[ej['over']], x), ports))]
+            else:
+                ej = {}
+            if maybe_port_match:
+                ssh_port = [x.string for x in maybe_port_match]
+                if args.forward:
+                    local_port, remote_port = args.forward.split(",")[1:]
+                else:
+                    local_port, remote_port = "", ""
+                if args.connect or args.forward:
+                    connect_or_forward(args.remote, user, ssh_port, ej,
+                                       local_port, remote_port, args.print_only)
+                elif args.copy_to or args.copy_from:
+                    if not args.src:
+                        print("Error. Source file not given")
+                        sys.exit(1)
+                    elif not args.dest:
+                        print("Error. Destination path not given")
+                        sys.exit(1)
+                    if args.copy_to:
+                        copy_to(args.remote, user, ssh_port, over={},
+                                src=args.src, dest=args.dest, print_only=args.print_only)
+                    else:
+                        copy_from(args.remote, user, ssh_port, over={},
+                                  src=args.src, dest=args.dest, print_only=args.print_only)
+            else:
+                not_found_string = f"Port for user {user} over {ej['over']} not found"\
+                    if ej else f"Port for user {user} not found"
+                print(not_found_string)
+        else:
+            print(f"No such user {user}")
+    elif args.list_users:
+        print(f"{', '.join(user_map.keys())}")
+    else:
+        ports = check_ports(args.remote, ports_regex)
+        available_ports = {}
+        for k, v in user_map.items():
+            available_ports[k] = []
+            for p in ports:
+                if re.match(v, p):
+                    available_ports[k].append(p)
+        print(", ".join([f"{k}: {v}" for k, v in available_ports.items()]))
+
+
+def maybe_choose_port(ssh_port: List[str]) -> str:
+    if len(ssh_port) == 1:
+        port = ssh_port[0]
+    else:
+        port = ""
+        while port not in ssh_port:
+            index = input(f"Choose the index of port to use of the ports: {[*enumerate(ssh_port)]}")
+            try:
+                port = ssh_port[int(index)]
+            except Exception:
+                port = ""
+    return port
+
+
+def connect_or_forward(remote, user, ssh_port, extra_jump,
+                       local_port, remote_port, print_only):
+    port = maybe_choose_port(ssh_port)
+    if local_port and remote_port:
+        try:
+            if extra_jump:
+                fwd(remote, extra_jump["destination"], port,
+                    local_port, remote_port, extra_jump["over"],
+                    print_only=print_only)
+            else:
+                fwd(remote, user, port, local_port, remote_port,
+                    print_only=print_only)
+        except Exception as e:
+            print(f"Error {e}")
+    else:
+        if extra_jump:
+            connect(remote, extra_jump["destination"], port,
+                    extra_jump['over'], print_only=print_only)
+        else:
+            connect(remote, user, port, print_only=print_only)
+
+
+def check_ports(remote, ports_regex):
+    p = Popen(f'ssh {remote} "ss -natp" | grep -o "{ports_regex}" | sort -u',
+              shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    ports = [*filter(None, out.decode().split("\n"))]
+    return ports
+
+
+def connect(remote, user, port, over={}, print_only=False):
+    if over:
+        run_string = f"ssh -J {remote},{over}@localhost:{port} {user}"
+    else:
+        run_string = f"ssh -J {remote} {user}@localhost -p {port}"
+    if print_only:
+        print(f"Only printing the command")
+        print(run_string)
+    else:
+        run(run_string, shell=True)
+
+
+def fwd(remote, user, ssh_port, local_port, remote_port, over={},
+        print_only=False):
+    if over:
+        run_string = f"ssh -L {local_port}:localhost:{remote_port} " +\
+            f"-J {remote},{over}@localhost:{ssh_port} {user} " +\
+            "\"hostname && /bin/bash\""
+    else:
+        run_string = f"ssh -L {local_port}:localhost:{remote_port} " +\
+            f"-J {remote} {user}@localhost -p {ssh_port} " +\
+            "\"hostname && /bin/bash\""
+    if print_only:
+        print(f"Only printing the command")
+        print(run_string)
+    else:
+        run(run_string, shell=True)
+
+
+def copy_to(remote, user, ssh_port, over, src, dest, print_only=False):
+    port = maybe_choose_port(ssh_port)
+    if over:
+        print("Jumping over multiple hosts is not supported for copy")
+        sys.exit(1)
+    ssh_cmd = f"ssh -J {remote} -p {port}"
+    run_string = f"rsync -avz -e \"{ssh_cmd}\" -P {src} {user}@localhost:{dest}"
+    if print_only:
+        print(f"Only printing the command")
+        print(run_string)
+    else:
+        run(run_string, shell=True)
+
+
+def copy_from(remote, user, ssh_port, over, src, dest, print_only=False):
+    port = maybe_choose_port(ssh_port)
+    if over:
+        print("Jumping over multiple hosts is not supported for copy")
+        sys.exit(1)
+    ssh_cmd = f"ssh -J {remote} -p {port}"
+    run_string = f"rsync -avz -e \"{ssh_cmd}\" -P {user}@localhost:{src} {dest}"
+    if print_only:
+        print(f"Only printing the command")
+        print(run_string)
+    else:
+        run(run_string, shell=True)
+
+
+if __name__ == '__main__':
+    main()
