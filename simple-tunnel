@@ -91,6 +91,11 @@ single quotes to stop them being interpreted on the local machine.
                         help="Forward the remote_port to local port.\n" +
                         "Should be a comma pair of 'user,local_port,remote_port'.\n" +
                         "E.g., 'mytunnel -f user,8181,4444'")
+    parser.add_argument("-pt", "--proxy-to", type=str, default="",
+                        help="Proxy to the remote host at given port.\n" +
+                        "Should be a comma pair of 'user,local_port'.\n"
+                        "E.g., 'mytunnel -pt user,9150'\n" +
+                        "This will open a SOCKS proxy from remote to your machine.")
     parser.add_argument("-l", "--list-users", action="store_true", help="List all users")
     args = parser.parse_args()
     config_file = args.config_file
@@ -118,9 +123,10 @@ single quotes to stop them being interpreted on the local machine.
     if not at_most_one([*map(partial(getattr, args), commands)]):
         print(f"Only one of {commands} should be given")
         sys.exit(1)
-    if args.connect or args.forward or args.copy_to or args.copy_from:
+    if args.connect or args.forward or args.copy_to or args.copy_from or args.proxy_to:
         ports = check_ports(args.remote, ports_regex)
-        user = args.connect or args.forward.split(",")[0] or args.copy_to or args.copy_from
+        user = (args.connect or args.forward.split(",")[0] or args.copy_to or
+                args.copy_from or args.proxy_to.split(",")[0])
         if not user:
             print("User not given")
             sys.exit(1)
@@ -153,6 +159,10 @@ single quotes to stop them being interpreted on the local machine.
                     else:
                         copy_from(args.remote, user, ssh_port, over={},
                                   src=args.src, dest=args.dest, print_only=args.print_only)
+                elif args.proxy_to:
+                    user, local_port = args.proxy_to.split(",")
+                    proxy(args.remote, user, ssh_port, local_port,
+                          print_only=args.print_only)
             else:
                 not_found_string = f"Port for user {user} over {ej['over']} not found"\
                     if ej else f"Port for user {user} not found"
@@ -209,8 +219,12 @@ def connect_or_forward(remote, user, ssh_port, extra_jump,
 
 
 def check_ports(remote, ports_regex):
-    p = Popen(f'ssh {remote} "ss -natp" | grep -o "{ports_regex}" | sort -u',
-              shell=True, stdout=PIPE, stderr=PIPE)
+    if ":" in remote:
+        remote, port = remote.split(":")
+    else:
+        remote, port = remote, 22
+    ssh_cmd = f'ssh {remote} -p {port} "ss -natp" | grep -o "{ports_regex}" | sort -u'
+    p = Popen(ssh_cmd, shell=True, stdout=PIPE, stderr=PIPE)
     out, err = p.communicate()
     ports = [*filter(None, out.decode().split("\n"))]
     return ports
@@ -268,6 +282,16 @@ def copy_from(remote, user, ssh_port, over, src, dest, print_only=False):
     run_string = f"rsync -avz -e \"{ssh_cmd}\" -P {user}@localhost:{src} {dest}"
     if print_only:
         print(f"Only printing the command")
+        print(run_string)
+    else:
+        run(run_string, shell=True)
+
+
+def proxy(remote, user, ssh_port, local_port, print_only=False):
+    port = maybe_choose_port(ssh_port)
+    run_string = f"ssh -N -D 0.0.0.0:{local_port} -J {remote} {user}@localhost -p {port}"
+    if print_only:
+        print("Only printing the command")
         print(run_string)
     else:
         run(run_string, shell=True)
