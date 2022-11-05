@@ -20,7 +20,7 @@ def at_most_one(args):
 
 example_config = """
 {
-  "remote": "user@some_ip",
+  "remote": "user@some_ip:[optional_port_other_than_22]",
   "port_regex_map": {"[11]22[0-9][0-9]": "user_a,user_b",
                      "[22]33[0-9][0-9]": "user_c,user_d"}
 }
@@ -45,7 +45,9 @@ def main():
                         "to either use a different config file or override options on the command line\n\n" +
                         f"An example config is:\n {example_config}")
     parser.add_argument("-r", "--remote", default="",
-                        help="The remote intermediary instance")
+                        help="The remote intermediary instance\n" +
+                        "If a port other than 22 is used then it should be given as:\n" +
+                        "{user@remote_ip:port}")
     parser.add_argument("-cf", "--copy-from", type=str, default="",
                         help="Copy from the remote system to local\n" +
                         "\"src\" and \"dest\" must be specified when copying" +
