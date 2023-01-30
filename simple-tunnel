@@ -52,8 +52,8 @@ def main():
                         help="Copy from the remote system to local\n" +
                         "\"src\" and \"dest\" must be specified when copying" +
                         """
-Example:
 
+Example:
     mytunnel -cf user --src /path/of/remote/file --dest local/path
 
 Note that you'll have to put any shell expansions for the remote path in
@@ -67,14 +67,22 @@ single quotes to stop them being interpreted on the local machine.
                         help="Copy to the remote system from local\n" +
                         "\"src\" and \"dest\" must be specified when copying" +
                         """
-Example:
 
+Example:
     mytunnel -ct user --src local/path --dest /path/of/remote/file
 
 Note that you'll have to put any shell expansions for the remote path in
 single quotes to stop them being interpreted on the local machine.
 
     mytunnel -cf user --src local/path --dest '~/remote/file/path'
+
+""")
+    parser.add_argument("-e", "--exclude", type=str, default="",
+                        help="""Comma separated wildcards of files to exclude.
+Only applicable when doing copy-to or copy-from
+
+Example:
+    mytunnel -cf user -s /path/of/remote/*.ext -d local/path -e file1.ext,file2.ext
 
 """)
     parser.add_argument("-s", "--src", type=str, default="",
@@ -157,10 +165,12 @@ single quotes to stop them being interpreted on the local machine.
                         sys.exit(1)
                     if args.copy_to:
                         copy_to(args.remote, user, ssh_port, over={},
-                                src=args.src, dest=args.dest, print_only=args.print_only)
+                                src=args.src, dest=args.dest, exclude=args.exclude,
+                                print_only=args.print_only)
                     else:
                         copy_from(args.remote, user, ssh_port, over={},
-                                  src=args.src, dest=args.dest, print_only=args.print_only)
+                                  src=args.src, dest=args.dest, exclude=args.exclude,
+                                  print_only=args.print_only)
                 elif args.proxy_to:
                     user, local_port = args.proxy_to.split(",")
                     proxy(args.remote, user, ssh_port, local_port,
@@ -238,7 +248,7 @@ def connect(remote, user, port, over={}, print_only=False):
     else:
         run_string = f"ssh -J {remote} {user}@localhost -p {port}"
     if print_only:
-        print(f"Only printing the command")
+        print("Only printing the command")
         print(run_string)
     else:
         run(run_string, shell=True)
@@ -255,35 +265,41 @@ def fwd(remote, user, ssh_port, local_port, remote_port, over={},
             f"-J {remote} {user}@localhost -p {ssh_port} " +\
             "\"hostname && /bin/bash\""
     if print_only:
-        print(f"Only printing the command")
+        print("Only printing the command")
         print(run_string)
     else:
         run(run_string, shell=True)
 
 
-def copy_to(remote, user, ssh_port, over, src, dest, print_only=False):
+def copy_to(remote, user, ssh_port, over, src, dest, exclude, print_only=False):
     port = maybe_choose_port(ssh_port)
     if over:
         print("Jumping over multiple hosts is not supported for copy")
         sys.exit(1)
     ssh_cmd = f"ssh -J {remote} -p {port}"
     run_string = f"rsync -avz -e \"{ssh_cmd}\" -P {src} {user}@localhost:{dest}"
+    if exclude:
+        for e in exclude.split(","):
+            run_string += f" --exclude={e}"
     if print_only:
-        print(f"Only printing the command")
+        print("Only printing the command")
         print(run_string)
     else:
         run(run_string, shell=True)
 
 
-def copy_from(remote, user, ssh_port, over, src, dest, print_only=False):
+def copy_from(remote, user, ssh_port, over, src, dest, exclude, print_only=False):
     port = maybe_choose_port(ssh_port)
     if over:
         print("Jumping over multiple hosts is not supported for copy")
         sys.exit(1)
     ssh_cmd = f"ssh -J {remote} -p {port}"
     run_string = f"rsync -avz -e \"{ssh_cmd}\" -P {user}@localhost:{src} {dest}"
+    if exclude:
+        for e in exclude.split(","):
+            run_string += f" --exclude={e}"
     if print_only:
-        print(f"Only printing the command")
+        print("Only printing the command")
         print(run_string)
     else:
         run(run_string, shell=True)
